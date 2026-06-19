@@ -6,6 +6,7 @@ type Stack struct {
 	Name       string   `json:"name"`
 	AccountID  string   `json:"accountId"`
 	System     bool     `json:"system"`
+	State      string   `json:"state"`
 	ServiceIDs []string `json:"serviceIds"`
 }
 

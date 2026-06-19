@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -18,18 +19,26 @@ type RancherClient struct {
 	accessKey  string
 	secretKey  string
 	httpClient *http.Client
+	debug      bool
 }
 
 // NewRancherClient builds an authenticated Rancher API client.
-func NewRancherClient(rawURL, accessKey, secretKey string, insecure bool) *RancherClient {
+// rawURL is normalised: any trailing /schemas, /v1, /v2-beta path is stripped
+// so that both "http://host:8080" and "http://host:8080/v2-beta/schemas" work.
+func NewRancherClient(rawURL, accessKey, secretKey string, insecure, debug bool) *RancherClient {
+	base := normaliseURL(rawURL)
+	if debug {
+		fmt.Fprintf(os.Stderr, "[debug] base URL resolved to: %s\n", base)
+	}
 	tr := &http.Transport{}
 	if insecure {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 	return &RancherClient{
-		baseURL:   strings.TrimRight(rawURL, "/"),
+		baseURL:   base,
 		accessKey: accessKey,
 		secretKey: secretKey,
+		debug:     debug,
 		httpClient: &http.Client{
 			Timeout:   60 * time.Second,
 			Transport: tr,
@@ -37,46 +46,53 @@ func NewRancherClient(rawURL, accessKey, secretKey string, insecure bool) *Ranch
 	}
 }
 
-// ListStacks returns all cattle stacks visible to this API token.
-func (c *RancherClient) ListStacks(includeAll, includeSystem bool) ([]Stack, error) {
-	v := url.Values{}
-	v.Set("limit", "-1")
-	v.Set("system", boolStr(includeSystem))
-	if includeAll {
-		v.Set("all", "true")
-	} else {
-		v.Set("removed_null", "1")
-		v.Add("state_ne", "inactive")
-		v.Add("state_ne", "stopped")
-		v.Add("state_ne", "removing")
-	}
-	resp, err := c.get("/stacks?" + v.Encode())
+// normaliseURL strips well-known suffixes so users can pass the full API URL
+// copied from a browser (e.g. http://host:8080/v2-beta/schemas) or just the
+// host (e.g. http://host:8080) and both will resolve to the right base.
+func normaliseURL(raw string) string {
+	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, err
+		return strings.TrimRight(raw, "/")
 	}
-	var out ListResponse[Stack]
-	if err := json.Unmarshal(resp, &out); err != nil {
-		return nil, err
-	}
-	all := out.Data
-	for out.Pagination != nil && out.Pagination.Next != "" {
-		resp, err = c.getAbs(out.Pagination.Next)
-		if err != nil {
-			return nil, err
-		}
-		out = ListResponse[Stack]{}
-		if err := json.Unmarshal(resp, &out); err != nil {
-			return nil, err
-		}
-		all = append(all, out.Data...)
-		if !out.Pagination.Partial {
-			break
+	p := u.Path
+	for _, suffix := range []string{"/schemas", "/v2-beta", "/v1"} {
+		if strings.HasSuffix(p, suffix) {
+			p = p[:len(p)-len(suffix)]
 		}
 	}
-	return all, nil
+	// Always append /v2-beta so all relative paths are consistent.
+	u.Path = strings.TrimRight(p, "/") + "/v2-beta"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
-// GetProject fetches a single Rancher v1.6 environment/project by ID.
+// ListProjects returns all Rancher v1.6 environments/projects.
+func (c *RancherClient) ListProjects() ([]Project, error) {
+	return paginate[Project](c, "/projects?limit=200")
+}
+
+// ListStacks returns stacks. When projectID is non-empty only stacks for that
+// project are fetched using the project-scoped endpoint.
+func (c *RancherClient) ListStacks(projectID string, includeAll, includeSystem bool) ([]Stack, error) {
+	v := url.Values{}
+	v.Set("limit", "200")
+	if !includeSystem {
+		v.Set("system", "false")
+	}
+	if !includeAll {
+		v.Add("state", "active")
+	}
+	var path string
+	if projectID != "" {
+		path = "/projects/" + projectID + "/stacks?" + v.Encode()
+	} else {
+		path = "/stacks?" + v.Encode()
+	}
+	return paginate[Stack](c, path)
+}
+
+// GetProject fetches a single project by ID.
 func (c *RancherClient) GetProject(id string) (*Project, error) {
 	resp, err := c.get("/projects/" + id)
 	if err != nil {
@@ -90,17 +106,51 @@ func (c *RancherClient) GetProject(id string) (*Project, error) {
 }
 
 // ExportConfig calls the Rancher exportconfig action for a stack.
-func (c *RancherClient) ExportConfig(stackID string, serviceIDs []string) (*ComposeConfig, error) {
+func (c *RancherClient) ExportConfig(projectID, stackID string, serviceIDs []string) (*ComposeConfig, error) {
 	payload, _ := json.Marshal(&ComposeInput{ServiceIDs: serviceIDs})
-	resp, err := c.post("/stacks/"+stackID+"?action=exportconfig", payload)
+	// Try project-scoped endpoint first, fall back to global.
+	path := "/projects/" + projectID + "/stacks/" + stackID + "?action=exportconfig"
+	resp, err := c.post(path, payload)
 	if err != nil {
-		return nil, err
+		c.debugf("project-scoped export failed (%v), falling back to global endpoint", err)
+		resp, err = c.post("/stacks/"+stackID+"?action=exportconfig", payload)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var cfg ComposeConfig
 	if err := json.Unmarshal(resp, &cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// paginate[T] fetches all pages of a Rancher list endpoint.
+func paginate[T any](c *RancherClient, path string) ([]T, error) {
+	resp, err := c.get(path)
+	if err != nil {
+		return nil, err
+	}
+	var out ListResponse[T]
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return nil, fmt.Errorf("decoding response: %w\nbody: %s", err, string(resp))
+	}
+	all := out.Data
+	for out.Pagination != nil && out.Pagination.Next != "" {
+		resp, err = c.getAbs(out.Pagination.Next)
+		if err != nil {
+			return nil, err
+		}
+		out = ListResponse[T]{}
+		if err := json.Unmarshal(resp, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if !out.Pagination.Partial {
+			break
+		}
+	}
+	return all, nil
 }
 
 func (c *RancherClient) get(path string) ([]byte, error) {
@@ -117,6 +167,9 @@ func (c *RancherClient) do(method, target string, body []byte) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
+		c.debugf("--> %s %s  body: %s", method, target, string(body))
+	} else {
+		c.debugf("--> %s %s", method, target)
 	}
 	req, err := http.NewRequest(method, target, reader)
 	if err != nil {
@@ -129,6 +182,7 @@ func (c *RancherClient) do(method, target string, body []byte) ([]byte, error) {
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		c.debugf("<-- ERROR: %v", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -136,8 +190,22 @@ func (c *RancherClient) do(method, target string, body []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.debugf("<-- %s  body: %s", resp.Status, truncate(string(data), 512))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("%s %s → %s: %s", method, target, resp.Status, string(data))
 	}
 	return data, nil
+}
+
+func (c *RancherClient) debugf(format string, args ...any) {
+	if c.debug {
+		fmt.Fprintf(os.Stderr, "[debug] "+format+"\n", args...)
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + fmt.Sprintf(" …[%d bytes total]", len(s))
 }

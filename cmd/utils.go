@@ -36,3 +36,10 @@ func ensureEmpty(path string) error {
 	}
 	return nil
 }
+
+// matchNameOrID returns true if name or id matches the filter string.
+// Comparison is case-insensitive.
+func matchNameOrID(name, id, filter string) bool {
+	f := strings.ToLower(strings.TrimSpace(filter))
+	return strings.ToLower(name) == f || strings.ToLower(id) == f
+}
