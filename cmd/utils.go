@@ -1,52 +1,38 @@
 package cmd
 
 import (
-	"io"
+	"fmt"
 	"os"
+	"strings"
 )
 
-func SaveFile(file string, content []byte) error {
-	f, err := os.Create(file)
+func safeName(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "/", "_")
+	s = strings.ReplaceAll(s, "\\", "_")
+	if s == "" {
+		return "unnamed"
+	}
+	return s
+}
+
+func boolStr(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
+}
+
+func ensureEmpty(path string) error {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
-	_, err = f.Write(content)
-	if err != nil {
-		return err
+	if len(entries) > 0 {
+		return fmt.Errorf("export-dir %q is not empty; choose an empty or new directory", path)
 	}
-
 	return nil
-}
-
-func IsDirEmpty(name string) (bool, error) {
-	f, err := os.Open(name)
-	if os.IsNotExist(err) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-
-	// read in ONLY one file
-	_, err = f.Readdir(1)
-
-	// and if the file is EOF... well, the dir is empty.
-	if err == io.EOF {
-		return true, nil
-	}
-
-	return false, err
-}
-
-func CreateDir(path string) error {
-	_, err := os.Stat(path)
-
-	if os.IsNotExist(err) {
-		return os.MkdirAll(path, 0755)
-	}
-
-	return err
 }

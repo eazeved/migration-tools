@@ -1,112 +1,167 @@
-migration-tools
-========
+# migration-tools
 
-This tool is to help migration efforts of apps running on Rancher 1.6 to Rancher 2.0.
+A modern reimplementation of the Rancher v1.6 → v2.x migration CLI.  
+Fully static Go binaries — no CGo, no shared libraries, no runtime dependencies.
 
-This tool will:
-- Export docker compose config files [docker-compose.yml and rancher-compose.yml] for every stack running on cattle environments on existing Rancher v1.6 system.
-- Parse docker compose config files and output a list of constructs present in the config file that cannot be supported onto Rancher 2.0 without special handling or that cannot be converted to Kubernetes YAML using [Kompose tool](https://github.com/kubernetes/kompose) tool.
+## Commands
 
-This should help users to export all docker compose config files, parse them and run a quick check to see if their application running on Rancher 1.6 can be migrated to 2.0 and what is lacking to do the migration.
+| Command | Purpose |
+|---------|---------|
+| `export` | Export `docker-compose.yml` and `rancher-compose.yml` for every cattle stack via the Rancher v1.6 API |
+| `parse`  | Analyse compose files for migration blockers and optionally run `kompose` to generate Kubernetes manifests |
 
-**Usage**
+---
 
-```
-# migration-tools -h
-NAME:
-   Rancher 1.6 to Rancher 2.0 migration-helper - Please check the options using --help flag
+## Requirements
 
-USAGE:
-   migration-tools [global options] command [command options] [arguments...]
+| Tool | Version | Notes |
+|------|---------|-------|
+| Go   | 1.22+   | <https://go.dev/dl/> |
+| kompose | any | Optional — only needed for `parse --kompose-bin`; <https://kompose.io> |
 
-VERSION:
-   git
+---
 
-AUTHOR:
-   Rancher Labs, Inc.
+## Build
 
-COMMANDS:
-     export   Export compose files for every stack running on cattle environment on a Rancher v1.6 system
-     parse    Parse docker-compose and rancher-compose files to get k8s manifests
-     help, h  Shows a list of commands or help for one command
+### Local binary (current OS/arch)
 
-GLOBAL OPTIONS:
-   --debug        debug logging
-   --log value    path to log to
-   --help, -h     show help
-   --version, -v  print the version
+```bash
+git clone https://github.com/eazeved/migration-tools
+cd migration-tools
+
+go build -trimpath -ldflags='-s -w' -o bin/migration-tools .
 ```
 
-```
-# migration-tools export -h
-NAME:
-   migration-tools export - Export compose files for every stack running on cattle environment on a Rancher v1.6 system
+### Cross-compile (all targets)
 
-USAGE:
-   migration-tools export [command options] [arguments...]
+Set `CROSS=true` and run the build script:
 
-OPTIONS:
-   --url value         Rancher API endpoint URL [$RANCHER_URL]
-   --access-key value  Rancher API access key. Using admin API key will export stacks on all cattle environments [$RANCHER_ACCESS_KEY]
-   --secret-key value  Rancher API secret key [$RANCHER_SECRET_KEY]
-   --export-dir value  Base directory under which compose files will be exported under sub-directories created for every env/stack (default: "export")
-   --all, -a           Export all stacks. Using this flag stacks with inactive, stopped and removing state, will also be exported
-   --system, -s        Export system and infrastructure stacks
+```bash
+CROSS=true bash scripts/build
 ```
 
+Outputs land in `build/bin/`:
+
 ```
-# migration-tools parse -h
-NAME:
-   migration-tools parse - Parse docker-compose and rancher-compose files to get k8s manifests
-
-USAGE:
-   migration-tools parse [command options] [arguments...]
-
-OPTIONS:
-   --docker-file value   Docker compose file to parse to get k8s manifest (default: "docker-compose.yml")
-   --output-file value   Output file where to write checks and advices for conversion (default: "output.txt")
-   --rancher-file value  Rancher compose file to parse to get k8s manifest (default: "rancher-compose.yml")
+build/bin/
+  migration-tools_linux-amd64
+  migration-tools_linux-arm64
+  migration-tools_linux-arm
+  migration-tools_darwin-amd64
+  migration-tools_darwin-arm64   ← Apple Silicon (M1/M2/M3/M4)
+  migration-tools_windows-amd64.exe
+  migration-tools_windows-386.exe
 ```
 
-**Output**
+### Manual cross-compile (one-liners)
 
-* export
-    - compose files
-        This command will connect to Rancher 1.6 system and generate docker-compose and rancher-compose files for every stack running on cattle environment. For every stack, files are exported in `<export-dir>/<env_name>/<stack_name>` folder.
-* parse
-    - output.txt
-		This command will generate `output.txt` file to list all constructs for each service in your docker-compose.yml file that will need to be handled specially to sucessfully migrate them to Rancher 2.0.
-    - Kubernetes YAML specs
-		This command also invokes the [Kompose tool](https://github.com/kubernetes/kompose) that generates some Kubernetes YAML specs for the services to get started with migration.
+```bash
+# macOS — Apple Silicon
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build \
+  -trimpath -ldflags='-s -w' -o bin/migration-tools_darwin-arm64 .
 
+# macOS — Intel
+GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build \
+  -trimpath -ldflags='-s -w' -o bin/migration-tools_darwin-amd64 .
 
-## Building
+# Linux amd64
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
+  -trimpath -ldflags='-s -w' -o bin/migration-tools_linux-amd64 .
+```
 
-You can find pre-built releases on the [Releases](https://github.com/rancher/migration-tools/releases) page. 
+---
 
-* Linux: Binary generated under `bin/`
-  `make`
+## Usage
 
-* Linux, darwin and windows: Binaries generated under `build/bin/`
-  `CROSS=1 make build`.
+### `export` — Export compose files from Rancher v1.6
 
-## Running
+Exports `docker-compose.yml`, `rancher-compose.yml`, and a `README.md` for
+every active cattle stack into a directory tree structured as
+`<export-dir>/<environment>/<stack>/`.
 
-Download from the [Releases](https://github.com/rancher/migration-tools/releases) page or build locally, then run: 
+```bash
+migration-tools export \
+  --url        https://rancher.example/v2-beta \
+  --access-key <RANCHER_ACCESS_KEY> \
+  --secret-key <RANCHER_SECRET_KEY> \
+  --export-dir ./export
+```
 
-`./bin/migration-tools`
+#### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--url` | *(required)* | Rancher v1.6 API endpoint |
+| `--access-key` | *(required)* | Rancher API access key |
+| `--secret-key` | *(required)* | Rancher API secret key |
+| `--export-dir` | `export` | Output directory (must be empty or new) |
+| `--all` | `false` | Include inactive, stopped and removing stacks |
+| `--system` | `false` | Include system/infrastructure stacks |
+| `--insecure` | `false` | Skip TLS certificate verification |
+
+#### Output layout
+
+```
+export/
+  <environment>/
+    <stack>/
+      docker-compose.yml
+      rancher-compose.yml
+      README.md
+```
+
+---
+
+### `parse` — Analyse compose files and generate Kubernetes manifests
+
+Reads a `docker-compose.yml` (and optional `rancher-compose.yml`) and emits
+a structured migration report. If `kompose` is available it also writes
+a `k8s-manifests.yaml` file.
+
+```bash
+migration-tools parse \
+  --docker-file  docker-compose.yml \
+  --rancher-file rancher-compose.yml \
+  --output-file  output.txt
+```
+
+#### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--docker-file` | `docker-compose.yml` | Path to docker-compose file |
+| `--rancher-file` | `rancher-compose.yml` | Path to rancher-compose file (optional) |
+| `--output-file` | `output.txt` | Path for the Markdown analysis report |
+| `--kompose-bin` | `kompose` | Path to `kompose` binary |
+
+#### Analysis checks
+
+| Check | Level | Reason |
+|-------|-------|--------|
+| `links` | WARN | Replace with Kubernetes Service DNS |
+| `depends_on` | WARN | No strict startup ordering in K8s |
+| `network_mode` | WARN | host/container modes require manual translation |
+| `privileged` | WARN | Review securityContext |
+| `devices` | WARN | Requires device plugins or privileged pods |
+| `volumes_from` | WARN | Convert to explicit volume mounts |
+| `build` | WARN | Push image to registry first |
+| `cap_add` / `cap_drop` | WARN | Translate to securityContext.capabilities |
+| `health_check` (rancher) | WARN | Convert to readiness/liveness probes |
+| `scale` (rancher) | INFO | Set as Deployment replicas |
+| missing `ports` | INFO | Verify whether a Service resource is needed |
+
+---
+
+## Concept mapping
+
+| Rancher v1.6 | Rancher v2.x / Kubernetes |
+|--------------|---------------------------|
+| environment  | project                   |
+| stack        | namespace                 |
+| service      | workload (Deployment)     |
+
+---
 
 ## License
-Copyright (c) 2018 [Rancher Labs, Inc.](http://rancher.com)
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-[http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0)
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+Apache 2.0 — see [LICENSE](LICENSE).
